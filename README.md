@@ -1,5 +1,5 @@
 <div align="center">
-  <img src=".github/assets/logo-rounded.png" alt="Harbor logo" width="112" />
+  <img src=".github/assets/icon-rounded.png" alt="Harbor logo" width="112" />
 
   <h1>Harbor</h1>
 
