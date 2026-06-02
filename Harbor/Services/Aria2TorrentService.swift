@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import OSLog
 
 enum TorrentEngineError: LocalizedError {
@@ -76,6 +77,12 @@ actor Aria2TorrentService {
         let name: String?
     }
 
+    private struct RunningDaemon {
+        let pid: pid_t
+        let parentPID: pid_t
+        let command: String
+    }
+
     nonisolated private let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "Harbor",
         category: "TorrentEngine"
@@ -143,21 +150,33 @@ actor Aria2TorrentService {
 
         switch sourceKind {
         case .magnetLink:
-            let gid = try await rpcCall(method: "aria2.addUri", params: [
-                authorizedToken(),
-                [sourceURL.absoluteString],
-                options
-            ], as: String.self)
+            let gid = try await rpcCallWithDaemonRestart(
+                method: "aria2.addUri",
+                params: {
+                    [
+                        try authorizedToken(),
+                        [sourceURL.absoluteString],
+                        options
+                    ]
+                },
+                as: String.self
+            )
             logger.info("aria2 accepted magnet download with gid \(gid, privacy: .public)")
             return gid
         case .torrentFile:
             let torrentData = try Data(contentsOf: sourceURL)
-            let gid = try await rpcCall(method: "aria2.addTorrent", params: [
-                authorizedToken(),
-                torrentData.base64EncodedString(),
-                [],
-                options
-            ], as: String.self)
+            let gid = try await rpcCallWithDaemonRestart(
+                method: "aria2.addTorrent",
+                params: {
+                    [
+                        try authorizedToken(),
+                        torrentData.base64EncodedString(),
+                        [],
+                        options
+                    ]
+                },
+                as: String.self
+            )
             logger.info("aria2 accepted torrent file with gid \(gid, privacy: .public)")
             return gid
         case .directURL:
@@ -166,48 +185,71 @@ actor Aria2TorrentService {
     }
 
     func pause(gid: String) async throws {
-        _ = try await rpcCall(method: "aria2.forcePause", params: [
-            authorizedToken(),
-            gid
-        ], as: String.self)
+        _ = try await rpcCallWithDaemonRestart(
+            method: "aria2.forcePause",
+            params: {
+                [
+                    try authorizedToken(),
+                    gid
+                ]
+            },
+            as: String.self
+        )
     }
 
     func unpause(gid: String) async throws {
-        _ = try await rpcCall(method: "aria2.unpause", params: [
-            authorizedToken(),
-            gid
-        ], as: String.self)
+        _ = try await rpcCallWithDaemonRestart(
+            method: "aria2.unpause",
+            params: {
+                [
+                    try authorizedToken(),
+                    gid
+                ]
+            },
+            as: String.self
+        )
     }
 
     func remove(gid: String) async {
+        guard process?.isRunning == true,
+              rpcPort != nil,
+              rpcSecret != nil,
+              let token = try? authorizedToken() else {
+            return
+        }
+
         _ = try? await rpcCall(method: "aria2.forceRemove", params: [
-            authorizedToken(),
+            token,
             gid
         ], as: String.self)
         _ = try? await rpcCall(method: "aria2.removeDownloadResult", params: [
-            authorizedToken(),
+            token,
             gid
         ], as: String.self)
     }
 
     func status(for gid: String) async throws -> TorrentStatusSnapshot {
-        try await ensureDaemonRunning()
-
-        let payload = try await rpcCall(method: "aria2.tellStatus", params: [
-            authorizedToken(),
-            gid,
-            [
-                "gid",
-                "status",
-                "totalLength",
-                "completedLength",
-                "downloadSpeed",
-                "uploadSpeed",
-                "errorMessage",
-                "files",
-                "bittorrent"
-            ]
-        ], as: StatusPayload.self)
+        let payload = try await rpcCallWithDaemonRestart(
+            method: "aria2.tellStatus",
+            params: {
+                [
+                    try authorizedToken(),
+                    gid,
+                    [
+                        "gid",
+                        "status",
+                        "totalLength",
+                        "completedLength",
+                        "downloadSpeed",
+                        "uploadSpeed",
+                        "errorMessage",
+                        "files",
+                        "bittorrent"
+                    ]
+                ]
+            },
+            as: StatusPayload.self
+        )
 
         let filePaths = payload.files?
             .compactMap(\.path)
@@ -231,10 +273,15 @@ actor Aria2TorrentService {
             return
         }
 
+        if process != nil || rpcPort != nil || rpcSecret != nil || stderrPipe != nil {
+            resetDaemon(terminateIfRunning: process?.isRunning == true)
+        }
+
         guard let binaryURL = Aria2BinaryResolver.resolveBinaryURL() else {
             throw TorrentEngineError.binaryNotFound
         }
 
+        terminateOrphanedDaemons(matching: binaryURL)
         logger.info("Launching aria2 from \(binaryURL.path, privacy: .public)")
 
         let port = Int.random(in: 18_000 ... 28_000)
@@ -282,6 +329,7 @@ actor Aria2TorrentService {
         for _ in 0 ..< 20 {
             if process.isRunning == false {
                 logger.error("aria2 exited before RPC became available")
+                resetDaemon(terminateIfRunning: false)
                 throw TorrentEngineError.startupFailed("aria2c exited before opening RPC.")
             }
 
@@ -299,6 +347,7 @@ actor Aria2TorrentService {
         }
 
         logger.error("Timed out waiting for aria2 RPC readiness")
+        resetDaemon(terminateIfRunning: true)
         throw TorrentEngineError.startupFailed("Timed out waiting for aria2 RPC.")
     }
 
@@ -321,6 +370,7 @@ actor Aria2TorrentService {
     private func downloadOptions(destinationFolderPath: String) -> [String: String] {
         var options = [
             "dir": destinationFolderPath,
+            "continue": "true",
             "pause": "false"
         ]
 
@@ -372,6 +422,27 @@ actor Aria2TorrentService {
         return "\(max(bytesPerSecond, 0))"
     }
 
+    private func rpcCallWithDaemonRestart<Result: Decodable>(
+        method: String,
+        params makeParams: () throws -> [Any],
+        as type: Result.Type
+    ) async throws -> Result {
+        try await ensureDaemonRunning()
+
+        do {
+            return try await rpcCall(method: method, params: try makeParams(), as: type)
+        } catch {
+            guard shouldRestartDaemon(after: error) else {
+                throw error
+            }
+
+            logger.warning("Restarting aria2 after RPC failure: \(error.localizedDescription, privacy: .public)")
+            resetDaemon(terminateIfRunning: true)
+            try await ensureDaemonRunning()
+            return try await rpcCall(method: method, params: try makeParams(), as: type)
+        }
+    }
+
     private func rpcCall<Result: Decodable>(
         method: String,
         params: [Any],
@@ -402,6 +473,118 @@ actor Aria2TorrentService {
         }
 
         return result
+    }
+
+    private func shouldRestartDaemon(after error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut,
+                 .cannotConnectToHost,
+                 .cannotFindHost,
+                 .networkConnectionLost,
+                 .notConnectedToInternet:
+                return true
+            default:
+                return false
+            }
+        }
+
+        if case TorrentEngineError.invalidResponse = error {
+            return true
+        }
+
+        return false
+    }
+
+    private func resetDaemon(terminateIfRunning: Bool) {
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+
+        if terminateIfRunning, process?.isRunning == true {
+            process?.terminate()
+        }
+
+        process = nil
+        rpcPort = nil
+        rpcSecret = nil
+        stderrPipe = nil
+    }
+
+    private func terminateOrphanedDaemons(matching binaryURL: URL) {
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        let binaryPath = binaryURL.path
+
+        for daemon in runningDaemons(matching: binaryPath) {
+            guard daemon.parentPID == 1,
+                  daemon.pid != currentPID,
+                  process?.processIdentifier != daemon.pid else {
+                continue
+            }
+
+            logger.warning("Terminating orphaned aria2 daemon with pid \(daemon.pid, privacy: .public)")
+            _ = kill(daemon.pid, SIGTERM)
+        }
+    }
+
+    private func runningDaemons(matching binaryPath: String) -> [RunningDaemon] {
+        let process = Process()
+        let outputPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-axo", "pid=,ppid=,command="]
+        process.standardOutput = outputPipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            logger.warning("Could not inspect aria2 processes: \(error.localizedDescription, privacy: .public)")
+            return []
+        }
+
+        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            return []
+        }
+
+        guard let output = String(data: data, encoding: .utf8) else {
+            return []
+        }
+
+        return output
+            .split(separator: "\n")
+            .compactMap { line in
+                daemon(from: String(line), binaryPath: binaryPath)
+            }
+    }
+
+    private func daemon(from processLine: String, binaryPath: String) -> RunningDaemon? {
+        let parts = processLine
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+
+        guard parts.count == 3,
+              let pid = pid_t(parts[0]),
+              let parentPID = pid_t(parts[1]) else {
+            return nil
+        }
+
+        let command = String(parts[2])
+        guard command.contains("--enable-rpc=true"),
+              isHarborManagedDaemon(command: command, binaryPath: binaryPath) else {
+            return nil
+        }
+
+        // TODO: Replace process-list cleanup with a persisted daemon lock if Harbor later supports multiple concurrent app instances.
+        return RunningDaemon(pid: pid, parentPID: parentPID, command: command)
+    }
+
+    private func isHarborManagedDaemon(command: String, binaryPath: String) -> Bool {
+        command.hasPrefix(binaryPath)
+            || (
+                command.contains("/Harbor.app/Contents/Resources/TorrentRuntime/")
+                    && command.contains("/bin/aria2c")
+            )
     }
 
     private nonisolated func installReadabilityHandler(for pipe: Pipe) {

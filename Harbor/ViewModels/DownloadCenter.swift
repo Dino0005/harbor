@@ -618,7 +618,31 @@ final class DownloadCenter {
 
         do {
             if let backendIdentifier = currentItem.backendIdentifier {
-                try await torrentService.unpause(gid: backendIdentifier)
+                do {
+                    try await torrentService.unpause(gid: backendIdentifier)
+                } catch {
+                    guard isStaleTorrentIdentifierError(error) else {
+                        throw error
+                    }
+
+                    guard let refreshedItem = item(for: id) else {
+                        return
+                    }
+
+                    refreshedItem.backendIdentifier = nil
+                    let replacementIdentifier = try await torrentService.addDownload(
+                        sourceKind: refreshedItem.sourceKind,
+                        sourceURL: refreshedItem.sourceURL,
+                        destinationFolderPath: refreshedItem.destinationFolderPath
+                    )
+
+                    guard let refreshedItem = item(for: id) else {
+                        await torrentService.remove(gid: replacementIdentifier)
+                        return
+                    }
+
+                    refreshedItem.backendIdentifier = replacementIdentifier
+                }
             } else {
                 let backendIdentifier = try await torrentService.addDownload(
                     sourceKind: currentItem.sourceKind,
@@ -762,6 +786,17 @@ final class DownloadCenter {
                 apply(snapshot: snapshot, to: item)
                 didMutate = true
             } catch {
+                if isStaleTorrentIdentifierError(error) {
+                    item.backendIdentifier = nil
+                    item.speedBytesPerSecond = 0
+                    item.uploadBytesPerSecond = 0
+                    item.updatedAt = .now
+                    item.lastError = "Torrent engine restarted. Resume to continue."
+                    setStatus(for: item, to: .paused)
+                    didMutate = true
+                    continue
+                }
+
                 if isTransientTorrentEngineError(error) {
                     item.speedBytesPerSecond = 0
                     item.uploadBytesPerSecond = 0
@@ -1333,6 +1368,20 @@ final class DownloadCenter {
         }
 
         return false
+    }
+
+    private func isStaleTorrentIdentifierError(_ error: Error) -> Bool {
+        guard case let TorrentEngineError.rpc(message) = error else {
+            return false
+        }
+
+        let normalizedMessage = message.lowercased()
+        return normalizedMessage.contains("gid")
+            && (
+                normalizedMessage.contains("not found")
+                    || normalizedMessage.contains("no such")
+                    || normalizedMessage.contains("not exist")
+            )
     }
 
     private func torrentErrorTitle(for error: Error) -> String {
