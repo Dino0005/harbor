@@ -11,24 +11,24 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
     case failed
     case cancelled
 
-    var title: String {
+    var title: LocalizedStringResource {
         switch self {
         case .queued:
-            "Queued"
+            LocalizedStringResource("status.queued", defaultValue: "Queued")
         case .preparing:
-            "Preparing"
+            LocalizedStringResource("status.preparing", defaultValue: "Preparing")
         case .downloading:
-            "Downloading"
+            LocalizedStringResource("status.downloading", defaultValue: "Downloading")
         case .browserSessionRequired:
-            "Browser Session Required"
+            LocalizedStringResource("status.needsBrowser", defaultValue: "Browser Session Required")
         case .paused:
-            "Paused"
+            LocalizedStringResource("status.paused", defaultValue: "Paused")
         case .completed:
-            "Completed"
+            LocalizedStringResource("status.completed", defaultValue: "Completed")
         case .failed:
-            "Failed"
+            LocalizedStringResource("status.failed", defaultValue: "Failed")
         case .cancelled:
-            "Cancelled"
+            LocalizedStringResource("status.cancelled", defaultValue: "Cancelled")
         }
     }
 
@@ -368,7 +368,11 @@ final class DownloadItem: Identifiable {
                 return infoHash
             }
 
-            return "Magnet Download"
+            return String(
+                localized: "download.displayName.magnet",
+                defaultValue: "Magnet Download",
+                comment: "Fallback display name for a magnet download before metadata is available."
+            )
         }
 
         if sourceKind == .torrentFile, sourceURL.isFileURL {
@@ -379,7 +383,11 @@ final class DownloadItem: Identifiable {
             return sourceURL.lastPathComponent
         }
 
-        return sourceURL.host ?? "Download"
+        return sourceURL.host ?? String(
+            localized: "download.displayName.generic",
+            defaultValue: "Download",
+            comment: "Generic fallback display name for a download."
+        )
     }
 
     var sourceHost: String {
@@ -387,9 +395,17 @@ final class DownloadItem: Identifiable {
         case .directURL:
             sourceURL.host ?? sourceURL.absoluteString
         case .magnetLink:
-            "Magnet Link"
+            String(
+                localized: "source.host.magnetLink",
+                defaultValue: "Magnet Link",
+                comment: "Source host fallback for magnet link downloads."
+            )
         case .torrentFile:
-            "Torrent File"
+            String(
+                localized: "source.host.torrentFile",
+                defaultValue: "Torrent File",
+                comment: "Source host fallback for local torrent file downloads."
+            )
         }
     }
 
@@ -397,7 +413,7 @@ final class DownloadItem: Identifiable {
         sourceURL.isFileURL ? sourceURL.path : sourceURL.absoluteString
     }
 
-    var sourceBadgeTitle: String {
+    var sourceBadgeTitle: LocalizedStringResource {
         sourceKind.title
     }
 
@@ -432,7 +448,7 @@ final class DownloadItem: Identifiable {
 
         switch status {
         case .queued, .preparing, .downloading:
-            return "Waiting"
+            return String(localized: "Waiting", comment: "Speed status fallback")
         case .browserSessionRequired, .paused, .completed, .failed, .cancelled:
             return "-"
         }
@@ -506,14 +522,21 @@ final class DownloadItem: Identifiable {
 
     static func displayErrorMessage(from rawMessage: String) -> String {
         if let existingPath = existingTorrentDestinationPath(from: rawMessage) {
-            return """
-            An item with this name already exists in the destination. Harbor stopped the torrent to avoid overwriting or truncating it.
+            let template = String(
+                localized: "error.torrent.duplicateDestination",
+                defaultValue: """
+                An item with this name already exists in the destination. Harbor stopped the torrent to avoid overwriting or truncating it.
 
-            Existing item:
-            \(existingPath)
+                Existing item:
+                %@
 
-            Move, rename, or delete the existing item, then retry the download.
-            """
+                Move, rename, or delete the existing item, then retry the download.
+                """,
+                comment: "Friendly torrent error shown when the target file already exists. Parameter is the existing file path."
+            )
+
+            // TODO: Keep torrent backend errors structured so future localizations do not depend on parsing raw aria2 text.
+            return String(format: template, existingPath)
         }
 
         return rawMessage
