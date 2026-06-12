@@ -3,6 +3,9 @@ import SwiftUI
 struct DownloadsContentView: View {
     let center: DownloadCenter
 
+    @AppStorage("downloads.table.columnCustomization")
+    private var columnCustomization = TableColumnCustomization<DownloadItem>()
+
     var body: some View {
         @Bindable var center = center
 
@@ -10,32 +13,48 @@ struct DownloadsContentView: View {
             if center.filteredDownloads.isEmpty {
                 emptyState
             } else {
-                Table(of: DownloadItem.self, selection: $center.selectedDownloadID) {
+                Table(
+                    of: DownloadItem.self,
+                    selection: $center.selectedDownloadID,
+                    columnCustomization: $columnCustomization
+                ) {
                     TableColumn("Name") { item in
                         DownloadNameCell(item: item)
                     }
+                    .customizationID("name")
+                    .disabledCustomizationBehavior(.visibility)
 
                     TableColumn("Status") { item in
                         DownloadStatusBadge(status: item.status)
                     }
+                    .customizationID("status")
+                    .defaultVisibility(.visible)
 
                     TableColumn("Transfer") { item in
                         DownloadTransferCell(item: item)
                     }
+                    .customizationID("transfer")
+                    .defaultVisibility(.visible)
 
                     TableColumn("Source") { item in
                         DownloadSourceCell(item: item)
                     }
+                    .customizationID("source")
+                    .defaultVisibility(.visible)
 
                     TableColumn("Speed") { item in
                         Text(item.speedText)
                             .monospacedDigit()
                     }
+                    .customizationID("speed")
+                    .defaultVisibility(.visible)
 
                     TableColumn("Updated") { item in
                         Text(DownloadFormatting.dateString(item.updatedAt))
                             .font(.caption)
                     }
+                    .customizationID("updated")
+                    .defaultVisibility(.visible)
                 } rows: {
                     ForEach(center.filteredDownloads) { item in
                         TableRow(item)
